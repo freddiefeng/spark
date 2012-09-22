@@ -268,6 +268,10 @@ class PairRDDFunctions[K: ClassManifest, V: ClassManifest](
     saveAsHadoopFile(path, getKeyClass, getValueClass, fm.erasure.asInstanceOf[Class[F]])
   }
   
+  def saveAsHadoopFiles[F <: OutputFormat[K, V]](path: String, f: Function1[(K, V), String])(implicit fm: ClassManifest[F]) {
+    saveAsHadoopFiles(path, getKeyClass, getValueClass, fm.erasure.asInstanceOf[Class[F]], f)
+  }
+  
   def saveAsNewAPIHadoopFile[F <: NewOutputFormat[K, V]](path: String)(implicit fm: ClassManifest[F]) {
     saveAsNewAPIHadoopFile(path, getKeyClass, getValueClass, fm.erasure.asInstanceOf[Class[F]])
   }
@@ -339,6 +343,22 @@ class PairRDDFunctions[K: ClassManifest, V: ClassManifest](
     saveAsHadoopDataset(conf)
   }
   
+  def saveAsHadoopFiles(
+      path: String,
+      keyClass: Class[_],
+      valueClass: Class[_],
+      outputFormatClass: Class[_ <: OutputFormat[_, _]],
+      f: Function1[(K, V), String],
+      conf: JobConf = new JobConf) {
+	  conf.setOutputKeyClass(keyClass)
+	  conf.setOutputValueClass(valueClass)
+	  // conf.setOutputFormat(outputFormatClass) // Doesn't work in Scala 2.9 due to what may be a generics bug
+	  conf.set("mapred.output.format.class", outputFormatClass.getName)
+	  conf.setOutputCommitter(classOf[FileOutputCommitter])
+	  FileOutputFormat.setOutputPath(conf, HadoopWriter.createPathFromString(path, conf))
+	  saveAsHadoopDatasets(conf, f)
+  }
+  
   def saveAsHadoopDataset(conf: JobConf) {
     val outputFormatClass = conf.getOutputFormat
     val keyClass = conf.getOutputKeyClass
@@ -375,6 +395,74 @@ class PairRDDFunctions[K: ClassManifest, V: ClassManifest](
 
     self.context.runJob(self, writeToFile _)
     writer.cleanup()
+  }
+  
+    def saveAsHadoopDatasets(conf: JobConf,
+      f: Function1[(K, V), String]) {
+    val outputFormatClass = conf.getOutputFormat
+    val keyClass = conf.getOutputKeyClass
+    val valueClass = conf.getOutputValueClass
+    if (outputFormatClass == null) {
+      throw new SparkException("Output format class not set")
+    }
+    if (keyClass == null) {
+      throw new SparkException("Output key class not set")
+    }
+    if (valueClass == null) {
+      throw new SparkException("Output value class not set")
+    }
+    
+    logInfo("Saving as hadoop file of type (" + keyClass.getSimpleName+ ", " + valueClass.getSimpleName+ ")")
+    
+    val writerMap = new HashMap[K, HadoopWriter]
+    //val writer = new HadoopWriter(conf)
+    // TODO writer.preSetup()
+    val sconf = new SerializableWritable(conf)
+
+    def writeToFile(context: TaskContext, iter: Iterator[(K,V)]) {
+      // Hadoop wants a 32-bit task attempt ID, so if ours is bigger than Int.MaxValue, roll it
+      // around by taking a mod. We expect that no task will be attempted 2 billion times.
+      val attemptNumber = (context.attemptId % Int.MaxValue).toInt
+      
+      val ids = " " + context.stageId + ":" + context.splitId + ":" + attemptNumber + " ";
+      
+      var count = 0
+      while(iter.hasNext) {
+        val record = iter.next
+        count += 1
+        var writer: HadoopWriter = if(writerMap.contains(record._1)) writerMap(record._1) else null
+        if(writer == null) {
+          logInfo ("Opening file for " + f(record) + ids + System.currentTimeMillis())
+          val writerConf = new JobConf(sconf.value)
+          val directory = FileOutputFormat.getOutputPath(writerConf)
+          FileOutputFormat.setOutputPath(writerConf, HadoopWriter.createPathFromString(directory + f(record), writerConf))
+          writer = new HadoopWriter(writerConf)
+          writer.preSetup()
+          writer.setup(context.stageId, context.splitId, attemptNumber)
+          writer.open()
+          logInfo ("Opened file for " + f(record) + ids + System.currentTimeMillis())
+          writerMap.put(record._1, writer)
+        }
+        writer.write(record._1.asInstanceOf[AnyRef], record._2.asInstanceOf[AnyRef])
+      }
+      writerMap.foreach(p => {
+        val w = p._2
+        logInfo ("Closing file for " + p._1 + ids + System.currentTimeMillis())
+        w.close()
+        logInfo ("Committing file for " + p._1 + ids + System.currentTimeMillis())
+        w.commit()
+        logInfo ("Committed file for " + p._1 + ids + System.currentTimeMillis())
+      })
+    }
+
+    self.context.runJob(self, writeToFile _)
+//    writerMap.values.foreach(w => w.cleanup())
+    writerMap.foreach(p => {
+        val w = p._2
+        logInfo ("Cleaning file for " + p._1 + " " + System.currentTimeMillis())
+        w.cleanup()
+        logInfo ("Cleaned file for " + p._1 + " " + System.currentTimeMillis())
+      })
   }
 
   def getKeyClass() = implicitly[ClassManifest[K]].erasure

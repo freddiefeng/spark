@@ -256,6 +256,14 @@ abstract class RDD[T: ClassManifest](@transient sc: SparkContext) extends Serial
       .saveAsHadoopFile[TextOutputFormat[NullWritable, Text]](path)
   }
 
+  // Save the values corresponding to different files based on their keys
+  def saveAsTextFiles(path: String, f: Function1[(Text, Text), String]) {
+    this.map{x => 
+      	val p = x.asInstanceOf[(String, String)]
+     	(new Text(p._1), new Text(p._2))
+      }.saveAsHadoopFiles[TextOutputFormat[Text, Text]](path, f)
+  }
+
   def saveAsObjectFile(path: String) {
     this.glom
       .map(x => (NullWritable.get(), new BytesWritable(Utils.serialize(x))))
